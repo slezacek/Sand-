@@ -29,6 +29,38 @@ is_system_disk() {
   lsblk -nro MOUNTPOINT "$1" 2>/dev/null | grep -qE '^(/|/boot|/boot/efi|/home|/cdrom|/run/live/medium|/isodevice)$'
 }
 
+# Odpojí flešku (Ubuntu ji po zasunutí samo připojí) a smaže její hlavičky. Připojení mimo
+# /media znamená, že ji používá systém (např. live USB): pak raději skončí.
+release_usb() {
+  local mp mps f p i
+  mps=$(lsblk -nrpo MOUNTPOINT "$USB" 2>/dev/null | grep -v '^$' || true)
+  for mp in $mps; do
+    case $mp in
+      /media/*|/run/media/*|/mnt/*) ;;
+      *) die "$USB používá systém (připojeno na $mp), odmítám ji přepsat" ;;
+    esac
+  done
+  if have losetup && [[ -n $mps ]]; then
+    while read -r f; do
+      for mp in $mps; do
+        [[ $f == "$mp"/* ]] && die "$USB používá systém (loop zařízení z $f), odmítám ji přepsat"
+      done
+    done < <(losetup -nO BACK-FILE 2>/dev/null || true)
+  fi
+  for i in 1 2 3 4 5; do
+    for p in $(lsblk -nrpo NAME "$USB" | tac); do
+      if have udisksctl; then udisksctl unmount -b "$p" --no-user-interaction >/dev/null 2>&1 || true; fi
+      umount "$p" 2>/dev/null || umount -l "$p" 2>/dev/null || true
+      swapoff "$p" 2>/dev/null || true
+    done
+    if wipefs -a "$USB" >/dev/null 2>&1; then return 0; fi
+    log "Fleška je ještě obsazená, zkouším znovu ($i/5)"
+    sleep 2
+  done
+  fuser -vm "$USB"* 2>&1 | head -10 || true
+  die "flešku $USB se nepodařilo uvolnit (zavři okna, která ji mají otevřenou, a spusť znovu)"
+}
+
 # apt bez přegenerování initramfs: kvůli pár nástrojům se bootovací obraz generovat nemá
 # (závislost dracut ho spustí a na některých systémech to visí hodiny).
 restore_initramfs() {
@@ -755,8 +787,7 @@ if [[ -n $USB ]]; then
     sync
     diskutil eject "$USB" >/dev/null || true
   else
-    for p in $(lsblk -nrpo NAME "$USB" | tail -n +2); do umount "$p" 2>/dev/null || true; done
-    wipefs -a "$USB" >/dev/null
+    release_usb
     parted -s "$USB" mklabel gpt mkpart WIN11AUTO fat32 1MiB 100% set 1 msftdata on
     partprobe "$USB" || true
     if have udevadm; then udevadm settle || true; fi
