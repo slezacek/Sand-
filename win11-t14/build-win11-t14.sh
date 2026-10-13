@@ -147,6 +147,8 @@ for model in ET.parse(path).getroot().iter():
         osn = (s.get('os') or '').lower()
         if not url or not ('11' in osn or re.search(r'w(in)?11', url.lower())):
             continue
+        if 'winpe' in osn or 'winpe' in url.lower():
+            continue  # balík jen pro Windows PE: bez videa a touchpadu
         m = re.match(r'(\d{2})H(\d)', (s.get('version') or '').upper())
         key = ((int(m.group(1)), int(m.group(2))) if m else (0, 0), s.get('date') or '', url)
         if best is None or key > best:
