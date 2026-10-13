@@ -14,7 +14,7 @@ OS=$(uname -s)
 ISO_IN=""; OUT_ISO="$PWD/win11-t14-auto.iso"; USB=""; EDITION="Home"
 WIN_USER=""; WIN_PASS="${WIN_PASSWORD:-}"; PC_NAME="T14-G3"
 LOCALE="cs-CZ"; KBD="0405:00000405"; TZ_WIN="Central Europe Standard Time"
-MTYPE=""; PACK=""; SKIP_DRIVERS=0; FORCE=0; WIFI_SSID=""; WIFI_PASS=""; REBOOT=0; SUDO_KA=""
+MTYPE=""; PACK=""; SKIP_DRIVERS=0; FORCE=0; WIFI_SSID=""; WIFI_PASS=""; NO_WIFI=0; REBOOT=0; SUDO_KA=""
 WORK="${WORK_DIR:-/var/tmp/win11-t14-build}"
 SPLIT_MB="${SPLIT_MB:-3800}"
 CATALOG_URL="${LENOVO_CATALOG:-https://download.lenovo.com/cdrt/td/catalogv2.xml}"
@@ -23,6 +23,27 @@ log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mCHYBA:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Linux/NetworkManager: převezme SSID a heslo wifi, ke které je tento počítač připojený.
+wifi_from_nm() {
+  have nmcli || return 0
+  local name ssid km psk
+  name=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
+           | awk -F: '$2=="802-11-wireless"{print $1; exit}') || true
+  [[ -n $name ]] || return 0
+  ssid=$(nmcli -g 802-11-wireless.ssid connection show "$name" 2>/dev/null | sed 's/\\\(.\)/\1/g') || true
+  km=$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$name" 2>/dev/null) || true
+  [[ -n $ssid ]] || return 0
+  case $km in
+    wpa-psk)
+      psk=$(nmcli -s -g 802-11-wireless-security.psk connection show "$name" 2>/dev/null | sed 's/\\\(.\)/\1/g') || true
+      [[ -n $psk ]] || { log "Wi-Fi '$ssid': heslo se nepodařilo přečíst, přeskakuji"; return 0; } ;;
+    "") psk="" ;;
+    *) log "Wi-Fi '$ssid' (zabezpečení $km) neumím přenést, přeskakuji"; return 0 ;;
+  esac
+  WIFI_SSID=$ssid; WIFI_PASS=$psk
+  log "Wi-Fi '$ssid' se převezme z tohoto počítače (heslo skončí na flešce, nesdílej ji)"
+}
 
 # Linux/UEFI: nastaví jednorázový start z právě zapsané flešky a restartuje (bez F12).
 boot_into_usb() {
@@ -59,6 +80,8 @@ Použití: ./build-win11-t14.sh [volby]
   --driver-pack CESTA  driver pack od Lenovo (.exe nebo rozbalená složka)
   --no-drivers         nevkládat Lenovo drivery
   --wifi SSID HESLO    předvyplnit wifi (WPA2), aby po instalaci šel Windows Update bez kabelu
+                       (na Linuxu se bez této volby převezme wifi, ke které je počítač připojený)
+  --no-wifi            žádnou wifi nepředvyplňovat
   --force              povolit zápis i na disk, který nevypadá jako externí
 EOF
 }
@@ -79,6 +102,7 @@ while (($#)); do
             WIFI_SSID=$2; WIFI_PASS=$3; shift 3 ;;
     --force) FORCE=1; shift ;;
     --reboot) REBOOT=1; shift ;;
+    --no-wifi) NO_WIFI=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "neznámá volba: $1" ;;
   esac
@@ -90,6 +114,8 @@ case $OS in
   Darwin) [[ $EUID -eq 0 ]] || SUDO=sudo ;;
   *) die "podporuji jen Linux a macOS" ;;
 esac
+
+if [[ -z $WIFI_SSID && $NO_WIFI -eq 0 && $OS == Linux ]]; then wifi_from_nm; fi
 
 case $(lc "$EDITION") in
   pro)  EDITION=Pro;  WIN_KEY="VK7JG-NPHTM-C97JM-9MPGT-3V66T" ;;
