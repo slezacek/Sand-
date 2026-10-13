@@ -24,6 +24,32 @@ die() { printf '\033[1;31mCHYBA:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
+# Disk, na kterém běží systém nebo live USB (kořen, /boot, /home, /cdrom): nikdy ho nepřepisovat.
+is_system_disk() {
+  lsblk -nro MOUNTPOINT "$1" 2>/dev/null | grep -qE '^(/|/boot|/boot/efi|/home|/cdrom|/run/live/medium|/isodevice)$'
+}
+
+# apt bez přegenerování initramfs: kvůli pár nástrojům se bootovací obraz generovat nemá
+# (závislost dracut ho spustí a na některých systémech to visí hodiny).
+restore_initramfs() {
+  local real=/usr/sbin/update-initramfs
+  if dpkg-divert --list "$real" 2>/dev/null | grep -q .; then
+    rm -f "$real"; dpkg-divert --local --rename --remove "$real" >/dev/null 2>&1 || true
+  fi
+}
+apt_install() {
+  local real=/usr/sbin/update-initramfs rc=0
+  if [[ -e $real ]] && dpkg-divert --local --rename --add "$real" >/dev/null 2>&1; then
+    ln -s /bin/true "$real"
+    trap 'restore_initramfs; exit 130' INT TERM
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  { dpkg --configure -a && apt-get update -qq && apt-get install -y -qq --no-install-recommends "$@"; } || rc=$?
+  restore_initramfs
+  trap - INT TERM
+  return "$rc"
+}
+
 # Linux/NetworkManager: převezme SSID a heslo wifi, ke které je tento počítač připojený.
 wifi_from_nm() {
   have nmcli || return 0
@@ -144,7 +170,7 @@ if ((${#need[@]})); then
   log "Instaluji: ${need[*]}"
   if [[ $OS == Linux ]]; then
     have apt-get || die "chybí ${need[*]} a není apt-get"
-    apt-get update -qq && apt-get install -y -qq "${need[@]}"
+    apt_install "${need[@]}" || die "instalace nástrojů selhala"
   else
     have brew || die "chybí ${need[*]}; nainstaluj Homebrew (https://brew.sh) a spusť skript znovu"
     brew install "${need[@]}"
@@ -334,7 +360,11 @@ if [[ $USB == auto ]]; then
   if [[ $OS == Darwin ]]; then
     cand=$(diskutil list external physical | awk '/^\/dev\/disk[0-9]+ /{print $1}')
   else
-    cand=$(lsblk -dnpo NAME,TRAN | awk '$2=="usb"{print $1}')
+    cand=""
+    for d in $(lsblk -dnpo NAME,TRAN | awk '$2=="usb"{print $1}'); do
+      if is_system_disk "$d"; then log "Přeskakuji $d (z něj běží tento systém)"; else cand="$cand $d"; fi
+    done
+    cand=$(printf '%s\n' $cand)
   fi
   [[ -n $cand ]] || die "nenašel jsem žádnou externí/USB flešku. Zasuň ji a spusť znovu."
   [[ $(printf '%s\n' "$cand" | wc -l) -eq 1 ]] || die "našel jsem víc externích disků ($(echo $cand)); zadej správný přes --usb"
@@ -360,8 +390,8 @@ if [[ -n $USB ]]; then
     if [[ $tran != usb && $FORCE -ne 1 ]]; then
       die "$USB nevypadá jako USB disk (TRAN='$tran'). Pokud to opravdu chceš, přidej --force."
     fi
-    if lsblk -nro MOUNTPOINT "$USB" | grep -qE '^(/|/boot|/boot/efi|/home)$'; then
-      die "$USB obsahuje systémové oddíly tohoto počítače, odmítám"
+    if is_system_disk "$USB"; then
+      die "$USB je disk, ze kterého běží tento počítač (systém nebo live USB), odmítám"
     fi
   fi
 
@@ -395,7 +425,7 @@ rm -rf "$X"; mkdir -p "$X"
 trap 'rm -rf "$X" "$WORK/single.wim"; if [[ -n $SUDO_KA ]]; then kill "$SUDO_KA" 2>/dev/null || true; fi' EXIT
 
 avail_kb=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
-((avail_kb > 28*1024*1024)) || die "v $WORK je málo místa (potřeba ~28 GB, WORK_DIR jde změnit)"
+((avail_kb > 28*1024*1024)) || die "v $WORK je volno $((avail_kb/1024/1024)) GB, potřeba ~28 GB (u live USB je místo jen v RAM; WORK_DIR jde nastavit na větší disk)"
 
 # --- rozbalení Windows ISO ------------------------------------------------------
 log "Rozbaluji Windows ISO (pár minut)"
