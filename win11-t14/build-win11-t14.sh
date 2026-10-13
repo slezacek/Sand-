@@ -14,7 +14,7 @@ OS=$(uname -s)
 ISO_IN=""; OUT_ISO="$PWD/win11-t14-auto.iso"; USB=""; EDITION="Home"
 WIN_USER=""; WIN_PASS="${WIN_PASSWORD:-}"; PC_NAME="T14-G3"
 LOCALE="cs-CZ"; KBD="0405:00000405"; TZ_WIN="Central Europe Standard Time"
-MTYPE=""; PACK=""; SKIP_DRIVERS=0; FORCE=0
+MTYPE=""; PACK=""; SKIP_DRIVERS=0; FORCE=0; WIFI_SSID=""; WIFI_PASS=""
 WORK="${WORK_DIR:-/var/tmp/win11-t14-build}"
 SPLIT_MB="${SPLIT_MB:-3800}"
 CATALOG_URL="${LENOVO_CATALOG:-https://download.lenovo.com/cdrt/td/catalogv2.xml}"
@@ -37,6 +37,7 @@ Použití: ./build-win11-t14.sh [volby]
   --type 21AH          typ stroje pro výběr driveru (výchozí 21AH = T14 Gen 3 Intel)
   --driver-pack CESTA  driver pack od Lenovo (.exe nebo rozbalená složka)
   --no-drivers         nevkládat Lenovo drivery
+  --wifi SSID HESLO    předvyplnit wifi (WPA2), aby po instalaci šel Windows Update bez kabelu
   --force              povolit zápis i na disk, který nevypadá jako externí
 EOF
 }
@@ -53,6 +54,8 @@ while (($#)); do
     --type) MTYPE=$2; shift 2 ;;
     --driver-pack) PACK=$2; shift 2 ;;
     --no-drivers) SKIP_DRIVERS=1; shift ;;
+    --wifi) (($# >= 3)) || die "--wifi potřebuje SSID a HESLO (u otevřené sítě prázdné '')"
+            WIFI_SSID=$2; WIFI_PASS=$3; shift 3 ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "neznámá volba: $1" ;;
@@ -165,9 +168,10 @@ PYEOF
 
 cat > "$PY/winpe_dirs.py" <<'PYEOF'
 import os, re, shutil, sys
+from collections import Counter
 src, dst = sys.argv[1], sys.argv[2]
 SERIALIO = re.compile(r'i2c|gpio|serial\s*io|lpss', re.I)
-dirs, display, touch, serialio = set(), 0, 0, 0
+dirs, classes, serialio = set(), Counter(), 0
 for d, _, files in os.walk(src):
     for f in files:
         if not f.lower().endswith('.inf'):
@@ -178,12 +182,9 @@ for d, _, files in os.walk(src):
         else:
             text = raw.decode('utf-8-sig', 'ignore')
         m = re.search(r'^\s*Class\s*=\s*([A-Za-z0-9_]+)', text, re.I | re.M)
-        cls = m.group(1).lower() if m else ''
+        cls = m.group(1).lower() if m else '?'
+        classes[cls] += 1
         is_sio = cls == 'system' and bool(SERIALIO.search(f + text))
-        if cls == 'display':
-            display += 1
-        if cls in ('mouse', 'hidclass'):
-            touch += 1
         if is_sio:
             serialio += 1
         # do instalátoru (WinPE): úložiště, síť, vstupní zařízení a Serial IO (bez něj trackpad nejede)
@@ -191,10 +192,20 @@ for d, _, files in os.walk(src):
             dirs.add(d)
 for n, d in enumerate(sorted(dirs)):
     shutil.copytree(d, os.path.join(dst, '%03d_%s' % (n, os.path.basename(d))), dirs_exist_ok=True)
-print('WinPE driver složek: %d | v packu: video=%d, trackpad/myš=%d, Serial IO=%d' % (len(dirs), display, touch, serialio))
-for name, cnt in (('video (Display)', display), ('trackpad/myš (Mouse/HIDClass)', touch), ('Intel Serial IO (I2C)', serialio)):
-    if cnt == 0:
-        print('\033[1;33mVAROVÁNÍ:\033[0m v driver packu nejsou INF drivery pro %s, po instalaci to může chybět' % name)
+print('Obsah packu podle tříd zařízení: ' + ', '.join('%s=%d' % kv for kv in classes.most_common()))
+print('Do instalátoru (WinPE) šlo %d složek' % len(dirs))
+checks = (('video (Display)', classes['display']),
+          ('síť/wifi (Net)', classes['net']),
+          ('zvuk (Media)', classes['media']),
+          ('Bluetooth', classes['bluetooth']),
+          ('trackpad/myš/HID (Mouse, HIDClass)', classes['mouse'] + classes['hidclass']),
+          ('Intel Serial IO (I2C)', serialio),
+          ('čipset/ME (System)', classes['system']))
+missing = [name for name, cnt in checks if cnt == 0]
+for name in missing:
+    print('\033[1;33mVAROVÁNÍ:\033[0m v driver packu nejsou INF drivery pro %s, dohoní to Windows Update (pokud bude internet)' % name)
+if not missing:
+    print('Kontrola: video, síť, zvuk, Bluetooth, trackpad, Serial IO i čipset v packu jsou')
 PYEOF
 
 cat > "$PY/render.py" <<'PYEOF'
@@ -228,6 +239,23 @@ vals = {'UILANG': e['UILANG'], 'KBD': e['KBD'], 'LOCALE': e['LOCALE'], 'TZ': e['
 for k, v in vals.items():
     text = text.replace('@%s@' % k, escape(v))
 open(sys.argv[2], 'w', encoding='utf-8').write(text)
+ssid = e.get('WIFI_SSID', '')
+if ssid:
+    key = e.get('WIFI_PASS', '')
+    if key:
+        sec = ('<authEncryption><authentication>WPA2PSK</authentication><encryption>AES</encryption>'
+               '<useOneX>false</useOneX></authEncryption>'
+               '<sharedKey><keyType>passPhrase</keyType><protected>false</protected>'
+               '<keyMaterial>%s</keyMaterial></sharedKey>' % escape(key))
+    else:
+        sec = ('<authEncryption><authentication>open</authentication><encryption>none</encryption>'
+               '<useOneX>false</useOneX></authEncryption>')
+    prof = ('<?xml version="1.0"?>\n'
+            '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
+            '<name>%s</name>\n<SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>\n'
+            '<connectionType>ESS</connectionType>\n<connectionMode>auto</connectionMode>\n'
+            '<MSM><security>%s</security></MSM>\n</WLANProfile>\n' % (escape(ssid), escape(ssid), sec))
+    open(sys.argv[3], 'w', encoding='utf-8').write(prof)
 PYEOF
 
 cat > "$PY/plist_get.py" <<'PYEOF'
@@ -376,15 +404,19 @@ fi
 # --- skripty a odpovědní soubor ------------------------------------------------------
 crlf() { awk '{ printf "%s\r\n", $0 }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }
 
+# Skripty pro Windows jsou záměrně jen ASCII (PowerShell 5.1 čte UTF-8 bez BOM jako ANSI).
 cat > "$OEM/finish.cmd" <<'EOF'
 @echo off
 set LOG=C:\Drivers\finish.log
 echo [%date% %time%] start >> %LOG%
 if exist C:\Drivers\LenovoPack.exe C:\Drivers\LenovoPack.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\Drivers\Lenovo >> %LOG% 2>&1
 if exist C:\Drivers\Lenovo\ pnputil /add-driver C:\Drivers\Lenovo\*.inf /subdirs /install >> %LOG% 2>&1
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Drivers\activate.ps1 >> %LOG% 2>&1
-echo [%date% %time%] hotovo >> %LOG%
-shutdown /r /t 60 /c "Dokonceni instalace driveru"
+pnputil /scan-devices >> %LOG% 2>&1
+if exist C:\Drivers\wifi.xml netsh wlan add profile filename="C:\Drivers\wifi.xml" user=all >> %LOG% 2>&1
+if exist C:\Drivers\wifi.xml del /q C:\Drivers\wifi.xml
+schtasks /create /tn Win11PostInstall /tr "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Drivers\postinstall.ps1" /sc onstart /ru SYSTEM /rl HIGHEST /f >> %LOG% 2>&1
+echo [%date% %time%] done >> %LOG%
+shutdown /r /t 30 /c "Finishing driver installation"
 EOF
 crlf "$OEM/finish.cmd"
 
@@ -396,6 +428,57 @@ if ($k) {
 }
 EOF
 crlf "$OEM/activate.ps1"
+
+# Po každém startu: počká na síť, zkusí aktivaci a nainstaluje všechny dostupné aktualizace a
+# ovladače z Windows Update. Restartuje se, dokud je co instalovat (max 8 běhů), pak se úkol smaže.
+cat > "$OEM/postinstall.ps1" <<'EOF'
+$ErrorActionPreference = 'Continue'
+$log = 'C:\Drivers\postinstall.log'
+$cnt = 'C:\Drivers\postinstall.count'
+function Log($m) { Add-Content -Path $log -Value ("{0} {1}" -f (Get-Date -Format s), $m) }
+function Finish($m) { Log $m; schtasks /delete /tn Win11PostInstall /f | Out-Null; exit 0 }
+
+$n = 0
+if (Test-Path $cnt) { $n = [int](Get-Content $cnt) }
+$n++
+Set-Content -Path $cnt -Value $n
+Log "start, run $n"
+if ($n -gt 8) { Finish 'too many runs, giving up' }
+
+$online = $false
+for ($i = 0; $i -lt 60 -and -not $online; $i++) {
+    try { [void][System.Net.Dns]::GetHostEntry('www.msftconnecttest.com'); $online = $true }
+    catch { Start-Sleep -Seconds 5 }
+}
+if (-not $online) { Finish 'no network, Windows Update skipped' }
+
+& powershell -NoProfile -ExecutionPolicy Bypass -File C:\Drivers\activate.ps1 *>> $log
+
+$session = New-Object -ComObject Microsoft.Update.Session
+$searcher = $session.CreateUpdateSearcher()
+try { $found = $searcher.Search('IsInstalled=0 and IsHidden=0').Updates }
+catch { Log "search failed: $_"; exit 1 }
+
+$list = New-Object -ComObject Microsoft.Update.UpdateColl
+foreach ($u in $found) {
+    if ($u.Title -match 'Feature update') { continue }
+    if ($u.InstallationBehavior.CanRequestUserInput) { continue }
+    if (-not $u.EulaAccepted) { $u.AcceptEula() }
+    [void]$list.Add($u)
+    Log ("queued: " + $u.Title)
+}
+if ($list.Count -eq 0) { Finish 'nothing left to install, done' }
+
+$dl = $session.CreateUpdateDownloader()
+$dl.Updates = $list
+[void]$dl.Download()
+$inst = $session.CreateUpdateInstaller()
+$inst.Updates = $list
+$res = $inst.Install()
+Log ("install result {0}, reboot required: {1}" -f $res.ResultCode, $res.RebootRequired)
+Restart-Computer -Force
+EOF
+crlf "$OEM/postinstall.ps1"
 
 cat > "$WORK/autounattend.tpl" <<'EOF'
 <?xml version="1.0" encoding="utf-8"?>
@@ -555,7 +638,8 @@ EOF
 
 UILANG="$UI_LANG" KBD="$KBD" LOCALE="$LOCALE" TZW="$TZ_WIN" PCNAME="$PC_NAME" \
 KEY="$WIN_KEY" WUSER="$WIN_USER" WPASS="$WIN_PASS" HAVE_INF="$HAVE_INF" \
-  python3 "$PY/render.py" "$WORK/autounattend.tpl" "$X/autounattend.xml"
+WIFI_SSID="$WIFI_SSID" WIFI_PASS="$WIFI_PASS" \
+  python3 "$PY/render.py" "$WORK/autounattend.tpl" "$X/autounattend.xml" "$OEM/wifi.xml"
 rm -f "$WORK/autounattend.tpl"
 WIN_PASS=""
 
