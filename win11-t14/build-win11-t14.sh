@@ -453,12 +453,23 @@ fi
 log "Nastavení: $IMAGE_NAME, účet '$WIN_USER', $([[ -n $WIN_PASS ]] && echo 'heslo nastaveno' || echo 'bez hesla'), typ stroje $MTYPE"
 
 X="$WORK/tree"
-rm -rf "$X"; mkdir -p "$X"
-trap 'rm -rf "$X" "$WORK/single.wim"; if [[ -n $SUDO_KA ]]; then kill "$SUDO_KA" 2>/dev/null || true; fi' EXIT
+STAMP="$WORK/tree.ok"
+trap 'rm -f "$WORK/single.wim"; if [[ -n $SUDO_KA ]]; then kill "$SUDO_KA" 2>/dev/null || true; fi' EXIT
 
-avail_kb=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
-((avail_kb > 28*1024*1024)) || die "v $WORK je volno $((avail_kb/1024/1024)) GB, potřeba ~28 GB (u live USB je místo jen v RAM; WORK_DIR jde nastavit na větší disk)"
+# Navázání: rozbalené ISO s připravenou edicí se použije znovu, pokud jde o stejné ISO a edici.
+ISO_KEY="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(s.st_size, int(s.st_mtime))' "$ISO_IN") $ISO_IN $IMAGE_NAME $SPLIT_MB"
+UI_LANG=""
+if [[ -f $STAMP && $(head -1 "$STAMP") == "$ISO_KEY" && -d $X/sources ]]; then
+  UI_LANG=$(sed -n 2p "$STAMP")
+  log "Navazuji: rozbalené ISO z minula se použije znovu ($X)"
+  rm -rf "$X/sources/\$OEM\$" "$X/\$WinPEDriver\$" "$X/autounattend.xml"
+else
+  rm -rf "$X" "$STAMP"; mkdir -p "$X"
+  avail_kb=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
+  ((avail_kb > 28*1024*1024)) || die "v $WORK je volno $((avail_kb/1024/1024)) GB, potřeba ~28 GB (u live USB je místo jen v RAM; WORK_DIR jde nastavit na větší disk)"
+fi
 
+if [[ -z $UI_LANG ]]; then
 # --- rozbalení Windows ISO ------------------------------------------------------
 log "Rozbaluji Windows ISO (pár minut)"
 "$SZ" x -y -bd -o"$X" "$ISO_IN" >/dev/null || die "rozbalení ISO selhalo"
@@ -488,6 +499,8 @@ if ((size > SPLIT_MB*1024*1024)); then
 else
   mv "$WORK/single.wim" "$X/sources/install.wim"
 fi
+printf '%s\n%s\n' "$ISO_KEY" "$UI_LANG" > "$STAMP"
+fi
 
 # --- Lenovo drivery ---------------------------------------------------------------
 OEM="$X/sources/\$OEM\$/\$1/Drivers"
@@ -514,11 +527,17 @@ if ((SKIP_DRIVERS == 0)); then
 
   log "Připravuji drivery"
   DRV="$WORK/cache/drivers"
-  rm -rf "$DRV"; mkdir -p "$DRV"
-  if [[ -d $PACK ]]; then
-    cp -a "$PACK/." "$DRV/"
+  PACK_KEY="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(s.st_size, int(s.st_mtime))' "$PACK") $PACK"
+  if [[ -f $DRV.ok && $(cat "$DRV.ok") == "$PACK_KEY" ]]; then
+    log "Navazuji: rozbalené drivery z minula se použijí znovu"
   else
-    innoextract -q -d "$DRV" "$PACK" >/dev/null 2>&1 || "$SZ" x -y -bd -o"$DRV" "$PACK" >/dev/null 2>&1 || true
+    rm -rf "$DRV" "$DRV.ok"; mkdir -p "$DRV"
+    if [[ -d $PACK ]]; then
+      cp -a "$PACK/." "$DRV/"
+    else
+      innoextract -q -d "$DRV" "$PACK" >/dev/null 2>&1 || "$SZ" x -y -bd -o"$DRV" "$PACK" >/dev/null 2>&1 || true
+    fi
+    printf '%s\n' "$PACK_KEY" > "$DRV.ok"
   fi
   ninf=$(find "$DRV" -type f -iname '*.inf' | wc -l)
   if ((ninf > 0)); then
